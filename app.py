@@ -7,6 +7,7 @@ import json
 import requests
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Optional, Dict, Any, Tuple, List
 
 from profiles import PROFILES
 
@@ -14,13 +15,17 @@ from profiles import PROFILES
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "")
 
 # Remote ZAP
-ZAP_API = os.getenv("ZAP_API", "").rstrip("/")  # e.g. https://<zap-service>/ or http://...
-ZAP_API_KEY = os.getenv("ZAP_API_KEY", "")      # must match zap service key
+ZAP_API = os.getenv("ZAP_API", "").rstrip("/")          # e.g. https://<zap-service>  (NO trailing slash preferred)
+ZAP_API_KEY = os.getenv("ZAP_API_KEY", "")              # must match zap service key
 
+# ZAP "lite" controls
 ZAP_MAX_SECONDS = int(os.getenv("ZAP_MAX_SECONDS", "240"))
 ZAP_CHILDREN = int(os.getenv("ZAP_CHILDREN", "60"))
 ZAP_RECURSE = os.getenv("ZAP_RECURSE", "false").lower() in ("1", "true", "yes")
+ZAP_PASSIVE_SETTLE_SECONDS = int(os.getenv("ZAP_PASSIVE_SETTLE_SECONDS", "8"))  # lite: short wait for passive rules
+ZAP_ALERTS_MAX = int(os.getenv("ZAP_ALERTS_MAX", "20"))                          # cap findings returned
 
+# Nmap controls
 NMAP_MAX_SECONDS = int(os.getenv("NMAP_MAX_SECONDS", "60"))
 NMAP_MIN_BYTES = int(os.getenv("NMAP_MIN_BYTES", "300"))
 NMAP_GRACE_SECONDS = int(os.getenv("NMAP_GRACE_SECONDS", "30"))
@@ -30,8 +35,12 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
+# Reuse HTTP connections (faster + more reliable under load)
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "ACTIVSCAN-Lite/1.0"})
 
-def _now():
+
+def _now() -> int:
     return int(time.time())
 
 
@@ -143,78 +152,221 @@ def _zap_enabled() -> bool:
     return bool(ZAP_API) and bool(ZAP_API_KEY)
 
 
-def _zap_req(path: str, params: dict, timeout: int = 10):
-    # Always include apikey
+def _zap_url(path: str) -> str:
+    # path should start with "/JSON/..."
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{ZAP_API}{path}"
+
+
+def _zap_req(path: str, params: dict, timeout: int = 10) -> requests.Response:
     params = dict(params or {})
     params["apikey"] = ZAP_API_KEY
-    url = f"{ZAP_API}{path}"
-    r = requests.get(url, params=params, timeout=timeout)
+    url = _zap_url(path)
+    r = HTTP.get(url, params=params, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
     return r
 
 
-def _zap_api_ok() -> bool:
+def _zap_diag() -> Dict[str, Any]:
+    """
+    Returns a diagnostic object you can surface in job/debug.
+    Helps distinguish:
+      - unreachable
+      - auth failed
+      - redirect loops
+      - non-json responses
+    """
     if not _zap_enabled():
-        return False
+        return {"ok": False, "reason": "not_configured"}
+
     try:
-        r = _zap_req("/JSON/core/view/version/", {}, timeout=5)
-        return r.ok
-    except Exception:
-        return False
+        url = _zap_url("/JSON/core/view/version/")
+        r = HTTP.get(url, params={"apikey": ZAP_API_KEY}, timeout=6, allow_redirects=True)
+
+        # Auth failures from ZAP typically come as 401/403 (or 200 with an error payload depending on config)
+        diag = {
+            "ok": r.ok,
+            "http_status": r.status_code,
+            "final_url": r.url,
+            "redirects": len(r.history) if r.history else 0,
+        }
+
+        # Try parse JSON
+        try:
+            js = r.json()
+            diag["json"] = True
+            diag["version"] = js.get("version") or js.get("core", {}).get("version")
+            # If ZAP returns an API error envelope, capture that
+            if isinstance(js, dict) and ("code" in js or "message" in js):
+                diag["zap_error"] = js
+        except Exception:
+            diag["json"] = False
+            diag["body_head"] = (r.text or "")[:200]
+
+        # A redirect loop usually manifests as many redirects, or a final_url that differs and returns HTML
+        if diag.get("redirects", 0) >= 5:
+            diag["ok"] = False
+            diag["reason"] = "too_many_redirects"
+        elif r.status_code in (401, 403):
+            diag["ok"] = False
+            diag["reason"] = "auth_failed"
+        elif not r.ok:
+            diag["ok"] = False
+            diag["reason"] = "bad_status"
+        elif not diag.get("json", False):
+            diag["ok"] = False
+            diag["reason"] = "non_json_response"
+        else:
+            diag["reason"] = "ok"
+
+        return diag
+
+    except requests.exceptions.TooManyRedirects:
+        return {"ok": False, "reason": "too_many_redirects"}
+    except requests.exceptions.ConnectTimeout:
+        return {"ok": False, "reason": "connect_timeout"}
+    except requests.exceptions.ReadTimeout:
+        return {"ok": False, "reason": "read_timeout"}
+    except requests.exceptions.ConnectionError as ce:
+        return {"ok": False, "reason": "connection_error", "detail": str(ce)[:200]}
+    except Exception as e:
+        return {"ok": False, "reason": "unknown_error", "detail": str(e)[:200]}
 
 
-def _zap_target_url(target: str) -> str:
-    return f"https://{target}"
+def _zap_target_candidates(target: str) -> List[str]:
+    """
+    Try https first, then http. Some sites behave better when first accessed over http
+    (or have unusual redirect behaviour).
+    """
+    t = target.strip()
+    if t.startswith("http://") or t.startswith("https://"):
+        return [t]
+    return [f"https://{t}", f"http://{t}"]
 
 
 def _zap_access_url(url: str):
-    _zap_req("/JSON/core/action/accessUrl/", {"url": url}, timeout=10)
+    _zap_req("/JSON/core/action/accessUrl/", {"url": url}, timeout=12)
 
 
-def _zap_spider(url: str) -> str:
+def _zap_spider(url: str) -> Optional[str]:
     params = {
         "url": url,
         "maxChildren": ZAP_CHILDREN,
         "recurse": "true" if ZAP_RECURSE else "false",
     }
-    r = _zap_req("/JSON/spider/action/scan/", params, timeout=15)
-    return r.json().get("scan")
+    r = _zap_req("/JSON/spider/action/scan/", params, timeout=20)
+    return (r.json() or {}).get("scan")
 
 
-def _zap_is_spider_done(scan_id: str | None) -> bool:
+def _zap_is_spider_done(scan_id: Optional[str]) -> Tuple[bool, int]:
     if not scan_id:
-        return False
-    r = _zap_req("/JSON/spider/view/status/", {"scanId": scan_id}, timeout=10)
-    pct = int(r.json().get("status", "0"))
-    return pct >= 100
+        return (False, 0)
+    r = _zap_req("/JSON/spider/view/status/", {"scanId": scan_id}, timeout=12)
+    pct = int((r.json() or {}).get("status", "0"))
+    return (pct >= 100, pct)
 
 
-def _zap_alerts(baseurl: str):
-    r = _zap_req("/JSON/core/view/alerts/", {"baseurl": baseurl}, timeout=20)
-    alerts = r.json().get("alerts", [])
+def _zap_alerts_summary(baseurl: str) -> Dict[str, Any]:
+    """
+    Returns counts by risk. Useful even when alert list is empty.
+    """
+    r = _zap_req("/JSON/core/view/alertsSummary/", {"baseurl": baseurl}, timeout=20)
+    js = r.json() or {}
+    # ZAP returns something like {"alertsSummary": {"High": "1", "Medium":"2", ...}}
+    summary = js.get("alertsSummary", {}) if isinstance(js, dict) else {}
+    # Normalise
+    out = {"high": 0, "medium": 0, "low": 0, "info": 0}
+    for k, v in (summary or {}).items():
+        key = str(k).strip().lower()
+        try:
+            out[key] = int(v)
+        except Exception:
+            pass
+    return out
+
+
+def _zap_alerts(baseurl: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Pull a capped list of alerts and convert into your existing 'findings' format.
+    """
+    params = {"baseurl": baseurl, "start": 0, "count": int(limit)}
+    r = _zap_req("/JSON/core/view/alerts/", params, timeout=25)
+    alerts = (r.json() or {}).get("alerts", []) or []
+
     findings = []
     for a in alerts:
+        # risk: "High"/"Medium"/"Low"/"Informational"
+        risk = (a.get("risk") or "info").strip().lower()
+        conf = (a.get("confidence") or "").strip().lower()
+        url = a.get("url")
+        alert_name = a.get("alert")
+        param = a.get("param") or ""
+        evidence = a.get("evidence") or ""
+
+        # Keep backwards compatibility with your UI: title/severity/evidence
         findings.append({
-            "title": a.get("alert"),
-            "severity": a.get("risk") or "info",
-            "evidence": a.get("url")
+            "title": alert_name or "ZAP finding",
+            "severity": risk,               # high/medium/low/info
+            "evidence": url or "",
+            "confidence": conf,
+            "param": param,
+            "zap_plugin_id": a.get("pluginId"),
+            "description": a.get("description") or "",
+            "solution": a.get("solution") or "",
+            "reference": a.get("reference") or "",
+            "wascid": a.get("wascid"),
+            "cweid": a.get("cweid"),
+            "other": a.get("other") or "",
+            "attack": a.get("attack") or "",
+            "evidence_detail": evidence
         })
+
     return findings
 
 
-def _normalise(zap_findings, open_ports, notes):
-    risk_score = min(100, (len(zap_findings) * 10) + (len(open_ports) * 5))
+def _calc_risk_score(zap_summary: Dict[str, int], open_ports: List[Dict[str, Any]]) -> int:
+    # Conservative scoring; keep stable
+    high = int(zap_summary.get("high", 0))
+    med = int(zap_summary.get("medium", 0))
+    low = int(zap_summary.get("low", 0))
+    info = int(zap_summary.get("info", 0))
+
+    # Ports weighting: common web ports are lower weight; uncommon higher
+    port_points = 0
+    for p in open_ports:
+        port = int(p.get("port", 0))
+        if port in (80, 443):
+            port_points += 2
+        elif port in (8080, 8443):
+            port_points += 4
+        else:
+            port_points += 6
+
+    score = (high * 18) + (med * 10) + (low * 4) + min(10, info) + port_points
+    return max(0, min(100, score))
+
+
+def _normalise(zap_findings, zap_summary, open_ports, notes, zap_meta=None):
+    zap_summary = zap_summary or {"high": 0, "medium": 0, "low": 0, "info": 0}
+    risk_score = _calc_risk_score(zap_summary, open_ports)
+
     return {
         "status": "complete",
         "stage": "complete",
         "risk_score": risk_score,
         "summary": {
-            "critical": 0,
-            "high": len(zap_findings),
-            "medium": len(open_ports),
-            "low": 0
+            "critical": 0,  # lite mode doesn't attempt exploit confirmation
+            "high": int(zap_summary.get("high", 0)),
+            "medium": int(zap_summary.get("medium", 0)),
+            "low": int(zap_summary.get("low", 0)),
+            "info": int(zap_summary.get("info", 0)),
         },
-        "zap": {"findings": zap_findings},
+        "zap": {
+            "findings": zap_findings,
+            "summary": zap_summary,
+            "meta": zap_meta or {}
+        },
         "nmap": {"open_ports": open_ports},
         "notes": notes
     }
@@ -244,7 +396,7 @@ def start_scan():
     job_id = str(uuid.uuid4())
     nmap_out = f"/tmp/{job_id}_nmap.xml"
 
-    # Start Nmap
+    # Start Nmap (async)
     nmap_args = profile["nmap"]["args"]
     nmap_cmd = f'nmap {nmap_args} --host-timeout {NMAP_MAX_SECONDS}s -oX - "{target}" > "{nmap_out}"'
     subprocess.Popen(nmap_cmd, shell=True)
@@ -257,9 +409,15 @@ def start_scan():
         "profile": profile_name,
         "created_at": _now(),
         "nmap_out": nmap_out,
+
         "zap_status": "not_started",
         "zap_scan_id": None,
         "zap_findings": [],
+        "zap_summary": {"high": 0, "medium": 0, "low": 0, "info": 0},
+        "zap_baseurl": None,
+        "zap_diag": None,
+        "zap_meta": {},
+
         "notes": [],
     }
 
@@ -267,19 +425,43 @@ def start_scan():
     if not _zap_enabled():
         job["zap_status"] = "error"
         job["notes"].append("zap_not_configured")
-    elif not _zap_api_ok():
-        job["zap_status"] = "error"
-        job["notes"].append("zap_not_running")
+        job["zap_diag"] = {"ok": False, "reason": "not_configured"}
     else:
-        try:
-            url = _zap_target_url(target)
-            _zap_access_url(url)
-            scan_id = _zap_spider(url)
-            job["zap_status"] = "spidering"
-            job["zap_scan_id"] = scan_id
-        except Exception:
+        diag = _zap_diag()
+        job["zap_diag"] = diag
+
+        if not diag.get("ok"):
             job["zap_status"] = "error"
-            job["notes"].append("zap_api_error")
+            # Keep old note for UI compatibility, but add more specific notes too
+            job["notes"].append("zap_not_running")
+            job["notes"].append(f"zap_{diag.get('reason','unknown')}")
+        else:
+            # Try https then http (or use provided full URL)
+            candidates = _zap_target_candidates(target)
+            started = False
+            last_err = None
+
+            for url in candidates:
+                try:
+                    _zap_access_url(url)
+                    scan_id = _zap_spider(url)
+                    if scan_id:
+                        job["zap_status"] = "spidering"
+                        job["zap_scan_id"] = scan_id
+                        job["zap_baseurl"] = url
+                        job["zap_meta"] = {"started_url": url, "candidates": candidates}
+                        started = True
+                        break
+                    else:
+                        last_err = "no_scan_id"
+                except Exception as e:
+                    last_err = str(e)[:180]
+
+            if not started:
+                job["zap_status"] = "error"
+                job["notes"].append("zap_api_error")
+                if last_err:
+                    job["zap_diag"] = {**job.get("zap_diag", {}), "start_error": last_err}
 
     _save_job(job)
     return jsonify({"job_id": job_id})
@@ -299,24 +481,44 @@ def status(job_id):
 
     # Progress ZAP
     zap_status = job.get("zap_status", "not_started")
+
     if zap_status in ("spidering", "not_started"):
-        if not _zap_api_ok():
+        diag = _zap_diag()
+        job["zap_diag"] = diag
+
+        if not diag.get("ok"):
             job["zap_status"] = "error"
             if "zap_not_running" not in notes:
                 notes.append("zap_not_running")
+            reason = diag.get("reason", "unknown")
+            tag = f"zap_{reason}"
+            if tag not in notes:
+                notes.append(tag)
         else:
             if elapsed <= ZAP_MAX_SECONDS:
                 try:
-                    done = _zap_is_spider_done(job.get("zap_scan_id"))
+                    done, pct = _zap_is_spider_done(job.get("zap_scan_id"))
+                    job["zap_meta"] = {**(job.get("zap_meta") or {}), "spider_pct": pct}
+
                     if done:
-                        job["zap_findings"] = _zap_alerts(_zap_target_url(job["target"]))
+                        baseurl = job.get("zap_baseurl") or _zap_target_candidates(job["target"])[0]
+                        # Short passive settle window (lite)
+                        time.sleep(max(0, min(20, ZAP_PASSIVE_SETTLE_SECONDS)))
+
+                        # Fetch summary + capped list of alerts
+                        summary = _zap_alerts_summary(baseurl)
+                        findings = _zap_alerts(baseurl, limit=ZAP_ALERTS_MAX)
+
+                        job["zap_summary"] = summary
+                        job["zap_findings"] = findings
                         job["zap_status"] = "complete"
                     else:
                         job["zap_status"] = "spidering"
-                except Exception:
+                except Exception as e:
                     job["zap_status"] = "error"
                     if "zap_api_error" not in notes:
                         notes.append("zap_api_error")
+                    job["zap_diag"] = {**(job.get("zap_diag") or {}), "status_error": str(e)[:180]}
             else:
                 job["zap_status"] = "timed_out"
                 if "zap_timed_out" not in notes:
@@ -334,7 +536,12 @@ def status(job_id):
             "stage": "nmap",
             "elapsed_seconds": elapsed,
             "notes": notes,
-            "debug": {"nmap_file": nmap_info, "nmap_complete": False, "zap_status": job.get("zap_status")}
+            "debug": {
+                "nmap_file": nmap_info,
+                "nmap_complete": False,
+                "zap_status": job.get("zap_status"),
+                "zap_diag": job.get("zap_diag"),
+            }
         })
 
     if not nmap_ready and elapsed < (NMAP_MAX_SECONDS + NMAP_GRACE_SECONDS):
@@ -345,7 +552,11 @@ def status(job_id):
             "stage": "nmap",
             "elapsed_seconds": elapsed,
             "notes": notes,
-            "debug": {"nmap_file": nmap_info, "zap_status": job.get("zap_status")}
+            "debug": {
+                "nmap_file": nmap_info,
+                "zap_status": job.get("zap_status"),
+                "zap_diag": job.get("zap_diag"),
+            }
         })
 
     # Parse Nmap
@@ -368,12 +579,27 @@ def status(job_id):
         if "nmap_no_output" not in notes:
             notes.append("nmap_no_output")
 
-    result = _normalise(job.get("zap_findings", []), open_ports, notes)
+    # Build final response
+    zap_findings = job.get("zap_findings", []) or []
+    zap_summary = job.get("zap_summary", {"high": 0, "medium": 0, "low": 0, "info": 0}) or {"high": 0, "medium": 0, "low": 0, "info": 0}
+    zap_meta = job.get("zap_meta", {}) or {}
+    zap_diag = job.get("zap_diag", None)
+
+    if zap_diag:
+        zap_meta["diag"] = zap_diag
+    if job.get("zap_baseurl"):
+        zap_meta["baseurl"] = job.get("zap_baseurl")
+
+    result = _normalise(zap_findings, zap_summary, open_ports, notes, zap_meta=zap_meta)
+
     result["debug"] = {
         "elapsed_seconds": elapsed,
         "nmap_file": nmap_info,
         "zap_status": job.get("zap_status"),
-        "zap_findings_count": len(job.get("zap_findings", [])),
+        "zap_findings_count": len(zap_findings),
+        "zap_summary": zap_summary,
+        "zap_baseurl": job.get("zap_baseurl"),
+        "zap_diag": zap_diag,
         "target": job["target"],
         "profile": job["profile"]
     }
